@@ -576,20 +576,63 @@ window.GeoTools = (() => {
 
     // ---- Busca Unificada ----
     let bairrosCache = null;
+    let bairrosFromLive = false;
+    let viarioCache = null;
+    let viarioPromise = null;
 
     async function ensureBairrosList() {
-      if (bairrosCache) return bairrosCache;
-      try {
-        const url = `${buildServiceUrl('Hosted/bairros2025/FeatureServer/0')}/query?where=1%3D1&outFields=nome,memorial&returnGeometry=true&outSR=4326&maxAllowableOffset=0.0001&f=geojson`;
-        const resp = await fetch(url, { cache: 'no-store' });
-        if (resp.ok) {
-          const gj = await resp.json();
-          bairrosCache = gj.features || [];
+      const status = engine.ensureArcgisStatus ? await engine.ensureArcgisStatus() : 'offline';
+      if (bairrosCache && (bairrosFromLive || status !== 'online')) {
+        return bairrosCache;
+      }
+      if (status === 'online') {
+        try {
+          const url = `${buildServiceUrl('Hosted/bairros2025/FeatureServer/0')}/query?where=1%3D1&outFields=nome,memorial&returnGeometry=true&outSR=4326&maxAllowableOffset=0.0001&f=geojson`;
+          const resp = await window.GeoLayerEngine.fetchWithTimeout(url, { cache: 'no-store' }, 5000);
+          if (resp.ok) {
+            const gj = await resp.json();
+            if (gj.features?.length) {
+              bairrosCache = gj.features;
+              bairrosFromLive = true;
+              return bairrosCache;
+            }
+          }
+        } catch {
+          // cai para contingência local abaixo
         }
-      } catch {
-        bairrosCache = [];
+      }
+      if (window.GEOITAJAI_BUNDLE?.bairros?.features?.length) {
+        bairrosCache = window.GEOITAJAI_BUNDLE.bairros.features;
+        bairrosFromLive = false;
       }
       return bairrosCache || [];
+    }
+
+    async function ensureViarioFallbackList() {
+      if (viarioCache) return viarioCache;
+      if (viarioPromise) return viarioPromise;
+      viarioPromise = (async () => {
+        try {
+          const resp = await window.GeoLayerEngine.fetchWithTimeout(
+            'https://geoitajai.github.io/sie/data/viewsistviarioweb.geojson',
+            {},
+            10000
+          );
+          if (resp.ok) {
+            const gj = await resp.json();
+            viarioCache = gj.features || [];
+            return viarioCache;
+          }
+        } catch {
+          // ignore
+        }
+        return [];
+      })();
+      try {
+        return await viarioPromise;
+      } finally {
+        viarioPromise = null;
+      }
     }
 
     function norm(s) {
@@ -628,74 +671,126 @@ window.GeoTools = (() => {
         }
       }
 
+      const status = engine.ensureArcgisStatus ? await engine.ensureArcgisStatus() : 'offline';
       const digits = q.replace(/\D/g, '');
       if (digits.length >= 4) {
-        try {
-          const safe = q.replace(/'/g, "''");
-          const where = `inscricao LIKE '%${safe}%' OR inscricao LIKE '%${digits}%'`;
-          const url =
-            `${buildServiceUrl('Hosted/Planta_Cadastral/FeatureServer/0')}/query?` +
-            new URLSearchParams({
-              where,
-              outFields: 'inscricao,via,num,setor,quadra,lote,loteamento',
-              returnGeometry: 'true',
-              outSR: '4326',
-              resultRecordCount: '6',
-              f: 'geojson',
-            }).toString();
-          const resp = await fetch(url, { cache: 'no-store' });
-          if (resp.ok) {
-            const gj = await resp.json();
-            for (const f of gj.features || []) {
-              const p = f.properties || {};
-              results.push({
-                type: 'Lote Cadastral',
-                badge: 'Lote',
-                title: `Inscrição ${p.inscricao || '—'}`,
-                subtitle: `${p.via || 'Sem logradouro'}${p.num ? ', ' + p.num : ''} • Setor ${p.setor || '-'} Qd ${p.quadra || '-'} Lt ${p.lote || '-'}`,
-                geojson: f,
-                activateLayer: 'planta_cadastral',
-              });
+        let gotLiveLot = false;
+        if (status === 'online') {
+          try {
+            const safe = q.replace(/'/g, "''");
+            const where = `inscricao LIKE '%${safe}%' OR inscricao LIKE '%${digits}%'`;
+            const url =
+              `${buildServiceUrl('Hosted/Planta_Cadastral/FeatureServer/0')}/query?` +
+              new URLSearchParams({
+                where,
+                outFields: 'inscricao,via,num,setor,quadra,lote,loteamento',
+                returnGeometry: 'true',
+                outSR: '4326',
+                resultRecordCount: '6',
+                f: 'geojson',
+              }).toString();
+            const resp = await window.GeoLayerEngine.fetchWithTimeout(url, { cache: 'no-store' }, 5000);
+            if (resp.ok) {
+              const gj = await resp.json();
+              for (const f of gj.features || []) {
+                gotLiveLot = true;
+                const p = f.properties || {};
+                results.push({
+                  type: 'Lote Cadastral',
+                  badge: 'Lote',
+                  title: `Inscrição ${p.inscricao || '—'}`,
+                  subtitle: `${p.via || 'Sem logradouro'}${p.num ? ', ' + p.num : ''} • Setor ${p.setor || '-'} Qd ${p.quadra || '-'} Lt ${p.lote || '-'}`,
+                  geojson: f,
+                  activateLayer: 'planta_cadastral',
+                });
+              }
             }
+          } catch {
+            // tenta feições já carregadas no mapa abaixo
           }
-        } catch {
-          // ignore
+        }
+        if (!gotLiveLot) {
+          const seenInscs = new Set();
+          for (const lid of ['planta_cadastral', 'lotes_itajai']) {
+            const st = engine.activeLayers?.get(lid);
+            for (const f of st?.geojson?.features || []) {
+              const insc = String(f.properties?.inscricao || f.properties?.inscrlig || '');
+              if (insc && insc.includes(digits) && !seenInscs.has(insc)) {
+                seenInscs.add(insc);
+                results.push({
+                  type: 'Lote Cadastral',
+                  badge: 'Lote',
+                  title: `Inscrição ${insc}`,
+                  subtitle: 'Lote carregado na área visível (GeoItajaí)',
+                  geojson: f,
+                });
+                if (seenInscs.size >= 8) break;
+              }
+            }
+            if (seenInscs.size >= 8) break;
+          }
         }
       }
 
       if (q.length >= 3 && !coordHit) {
-        try {
-          const safeUpper = q.toUpperCase().replace(/'/g, "''");
-          const url =
-            `${buildServiceUrl('Hosted/itj_sistema_viario/FeatureServer/0')}/query?` +
-            new URLSearchParams({
-              where: `UPPER(nome) LIKE '%${safeUpper}%'`,
-              outFields: 'nome,hierarquia,largura',
-              returnGeometry: 'true',
-              outSR: '4326',
-              resultRecordCount: '8',
-              f: 'geojson',
-            }).toString();
-          const resp = await fetch(url, { cache: 'no-store' });
-          if (resp.ok) {
-            const gj = await resp.json();
-            const seenNames = new Set();
-            for (const f of gj.features || []) {
-              const p = f.properties || {};
-              const key = (p.nome || '').toUpperCase();
-              if (!key || seenNames.has(key)) continue;
-              seenNames.add(key);
-              results.push({
-                type: 'Logradouro',
-                badge: 'Via',
-                title: p.nome,
-                subtitle: `${p.hierarquia || 'Sistema Viário Municipal'}${p.largura ? ' • Largura: ' + p.largura + 'm' : ''}`,
-                geojson: f,
-              });
+        let gotLiveVias = false;
+        if (status === 'online') {
+          try {
+            const safeUpper = q.toUpperCase().replace(/'/g, "''");
+            const url =
+              `${buildServiceUrl('Hosted/itj_sistema_viario/FeatureServer/0')}/query?` +
+              new URLSearchParams({
+                where: `UPPER(nome) LIKE '%${safeUpper}%'`,
+                outFields: 'nome,hierarquia,largura',
+                returnGeometry: 'true',
+                outSR: '4326',
+                resultRecordCount: '8',
+                f: 'geojson',
+              }).toString();
+            const resp = await window.GeoLayerEngine.fetchWithTimeout(url, { cache: 'no-store' }, 5000);
+            if (resp.ok) {
+              const gj = await resp.json();
+              const seenNames = new Set();
+              for (const f of gj.features || []) {
+                const p = f.properties || {};
+                const key = (p.nome || '').toUpperCase();
+                if (!key || seenNames.has(key)) continue;
+                seenNames.add(key);
+                gotLiveVias = true;
+                results.push({
+                  type: 'Logradouro',
+                  badge: 'Via',
+                  title: p.nome,
+                  subtitle: `${p.hierarquia || 'Sistema Viário Municipal'}${p.largura ? ' • Largura: ' + p.largura + 'm' : ''}`,
+                  geojson: f,
+                });
+              }
             }
+          } catch {
+            // segue para contingência GeoItajaí abaixo
           }
-        } catch {
-          // ignore
+        }
+
+        if (!gotLiveVias) {
+          const vias = await ensureViarioFallbackList();
+          const seenNames = new Set();
+          for (const f of vias) {
+            const p = f.properties || {};
+            const nome = p.nome || p.nomevia || '';
+            if (!nome || !norm(nome).includes(qNorm)) continue;
+            const key = nome.toUpperCase();
+            if (seenNames.has(key)) continue;
+            seenNames.add(key);
+            const largura = p.largura ?? p.caixatotal;
+            results.push({
+              type: 'Logradouro',
+              badge: 'Via',
+              title: nome,
+              subtitle: `Sistema Viário (GeoItajaí)${largura ? ' • Caixa: ' + largura + 'm' : ''}${p.leidata ? ' • Lei ' + p.leidata : ''}`,
+              geojson: f,
+            });
+            if (seenNames.size >= 8) break;
+          }
         }
       }
 

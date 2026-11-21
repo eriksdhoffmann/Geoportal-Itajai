@@ -74,11 +74,24 @@
     }, action ? 6000 : 3600);
   }
 
+  function syncMapBackground() {
+    const mapEl = document.getElementById('map');
+    if (!mapEl) return;
+    const ids = [...engine.activeBasemaps];
+    const useLight =
+      ids.length === 0 ||
+      ids.every((id) => ['osm', 'carto_light', 'rest_2020', 'rest_1984'].includes(id));
+    mapEl.classList.toggle('map-light-bg', useLight);
+  }
+
   let tools = null;
   const engine = window.GeoLayerEngine.createEngine(map, {
     onStateChange: () => {
       renderLayerDrawer();
       if (activeFloatingPanel === 'basemaps') renderBasemapsPanel();
+    },
+    onBasemapChange: () => {
+      syncMapBackground();
     },
     onUserLayersChanged: () => {
       expandedGroups.add('user_imported');
@@ -120,8 +133,9 @@
     onSwipeStateChange: renderSwipeOverlay,
   });
 
-  // Inicialização padrão: Ortoimagem Aérea Itajaí 2024 (com underlay contínuo + recorte IBGE 4208203) + Limite + Bairros
+  // Inicialização padrão: Ortoimagem Aérea Itajaí 2024 (ou Satélite HD automático se ArcGIS indisponível) + Limite + Bairros
   engine.setBasemapActive('orto_2024', true, true);
+  syncMapBackground();
   engine.enableLayer('limite_municipal_ibge');
   engine.enableLayer('bairros_2025');
 
@@ -173,6 +187,23 @@
 
     const q = searchFilterText.trim().toLowerCase();
     const parts = [];
+
+    // 0. Indicador de status do servidor oficial / modo contingência
+    const arcStatus = engine.getArcgisStatus ? engine.getArcgisStatus() : 'unknown';
+    if (!q && arcStatus === 'offline') {
+      parts.push(`
+        <div class="gp-conn-banner is-contingency">
+          <span><b>Contingência Ativa:</b> servidor <code>arcgis.itajai.sc.gov.br</code> fora do ar; exibindo bases GeoItajaí / IBGE / OSM.</span>
+          <button class="gp-conn-retry-btn" data-retry-arcgis="1" title="Testar conexão com arcgis.itajai.sc.gov.br">Testar</button>
+        </div>
+      `);
+    } else if (!q && arcStatus === 'checking') {
+      parts.push(`
+        <div class="gp-conn-banner is-contingency">
+          <span>Verificando disponibilidade de <code>arcgis.itajai.sc.gov.br</code>...</span>
+        </div>
+      `);
+    }
 
     // 1. Atalhos rápidos de Mapas Base (Orto 2024 + Satélite HD + Satélite Híbrido)
     const quickBasemaps = BASEMAPS.filter((b) =>
@@ -243,20 +274,37 @@
         const sw = getLayerSwatchStyle(l);
         const optOpen = openOptionsLayerId === l.id;
 
+        let badgeHtml = '';
+        if (st?.loading) {
+          badgeHtml = '<span class="gp-spinner" title="Carregando feições..."></span>';
+        } else if (st?.zoomBlocked) {
+          badgeHtml = `<button class="gp-badge-zoom" data-zoom-min="${l.id}" title="Clique para aproximar ao zoom ${l.minZoom}">z${l.minZoom}+</button>`;
+        } else if (st?.offlineBlocked) {
+          badgeHtml = `<button class="gp-badge-error" data-layer-retry="${l.id}" title="${escapeHtml(st.error || 'Exclusiva do servidor arcgis.itajai.sc.gov.br — clique para testar')}">Offline ↻</button>`;
+        } else if (st?.error) {
+          badgeHtml = `<button class="gp-badge-error" data-layer-retry="${l.id}" title="${escapeHtml(st.error)}">Erro ↻</button>`;
+        } else if (isOn) {
+          if (st.isTileFallback) {
+            badgeHtml = `<span class="gp-badge-fallback" title="${escapeHtml(st.fallbackLabel || 'Camada matricial GeoItajaí')}">Tiles</span>`;
+          } else {
+            const altBadge = st.usingFallback
+              ? `<span class="gp-badge-fallback" title="${escapeHtml(st.fallbackLabel || 'Base GeoItajaí (Contingência)')}">Alt</span>`
+              : '';
+            const countBadge =
+              st.count > 0
+                ? `<span class="gp-badge-count" title="${st.count} feições carregadas">${st.count}</span>`
+                : '';
+            badgeHtml = `${altBadge}${countBadge}`;
+          }
+        }
+
         parts.push(`
           <div class="gp-layer-row is-child">
             <input type="checkbox" class="gp-checkbox" data-layer-toggle="${l.id}" ${isOn ? 'checked' : ''} />
             <span class="${sw.cls}" style="background:${sw.bg};${sw.border ? `border:${sw.border}` : ''}"></span>
             <span class="gp-layer-label" data-layer-label="${l.id}">${escapeHtml(l.name)}</span>
             <div class="gp-layer-meta-inline">
-              ${st?.loading ? '<span class="gp-spinner" title="Carregando feições..."></span>' : ''}
-              ${
-                st?.zoomBlocked
-                  ? `<button class="gp-badge-zoom" data-zoom-min="${l.id}" title="Clique para aproximar ao zoom ${l.minZoom}">z${l.minZoom}+</button>`
-                  : isOn && !st.loading && st.count > 0
-                  ? `<span class="gp-badge-count" title="${st.count} feições carregadas">${st.count}</span>`
-                  : ''
-              }
+              ${badgeHtml}
               <button class="gp-row-btn" data-layer-opts="${l.id}" title="Opções da camada (ordem, opacidade, zoom, exportar)">•••</button>
             </div>
           </div>
@@ -368,7 +416,7 @@
           .join('');
         return `
           <div class="gp-legend-card">
-            <div class="gp-legend-title">${escapeHtml(leg.name)}</div>
+            <div class="gp-legend-title">${escapeHtml(leg.name)}${leg.usingFallback ? ` <span class="gp-badge-fallback">${escapeHtml(leg.fallbackLabel || 'Alt')}</span>` : ''}</div>
             <div class="gp-legend-grid">${itemsHtml}</div>
           </div>
         `;
@@ -379,6 +427,16 @@
 
   // Event delegation no Controle de Camadas
   document.getElementById('drawerBody')?.addEventListener('click', (e) => {
+    const retryArc = e.target.closest('[data-retry-arcgis]');
+    if (retryArc) {
+      engine.recheckArcgisServer?.();
+      return;
+    }
+    const retryLayerBtn = e.target.closest('[data-layer-retry]');
+    if (retryLayerBtn) {
+      engine.reloadLayer?.(retryLayerBtn.dataset.layerRetry);
+      return;
+    }
     const clipChk = e.target.closest('[data-clip-toggle]');
     if (clipChk) {
       engine.setMunicipalClip(clipChk.checked);
@@ -930,7 +988,7 @@
       <div class="gp-btn-row">
         <button class="gp-btn" id="btnCopyPointCoords">Copiar</button>
         <a class="gp-btn" href="https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${latlng.lat},${latlng.lng}" target="_blank" rel="noopener">Street View ↗</a>
-        <a class="gp-btn primary" href="https://arcgis.itajai.sc.gov.br/geoitajai/plantacadastral/plantacadastral.html" target="_blank" rel="noopener">Planta Cadastral ↗</a>
+        <a class="gp-btn primary" href="${engine.getArcgisStatus?.() === 'online' ? 'https://arcgis.itajai.sc.gov.br/geoitajai/plantacadastral/plantacadastral.html' : 'https://geoitajai.github.io/desenveconomico/plantacadastral.html'}" target="_blank" rel="noopener">Planta Cadastral ↗</a>
       </div>
     `;
 
@@ -1188,6 +1246,14 @@
         });
       });
     } else if (navId === 'docs') {
+      const isOnline = engine.getArcgisStatus?.() === 'online';
+      const plantaUrl = isOnline
+        ? 'https://arcgis.itajai.sc.gov.br/geoitajai/plantacadastral/plantacadastral.html'
+        : 'https://geoitajai.github.io/desenveconomico/plantacadastral.html';
+      const zonaUrl = isOnline
+        ? 'https://arcgis.itajai.sc.gov.br/portal/apps/experiencebuilder/experience/?id=03284fdd05e04bcfbe1ab51d1801efb2'
+        : 'https://geoitajai.github.io/desenveconomico/consultazoneamento.html';
+      const portalUrl = isOnline ? 'https://geo.itajai.sc.gov.br/' : 'https://geoitajai.github.io/';
       modalTitle.textContent = 'Emissão de Documentos e Consultas Oficiais — Itajaí';
       modalBody.innerHTML = `
         <p style="margin:0 0 16px;color:#475569;line-height:1.5">
@@ -1199,14 +1265,14 @@
               <div class="gp-preset-title">Planta Cadastral e Espelho do Lote</div>
               <div class="gp-preset-desc">Consulte BCI, matrícula, confrontantes, planta de localização e dados tributários por inscrição imobiliária.</div>
             </div>
-            <a class="gp-btn primary" href="https://arcgis.itajai.sc.gov.br/geoitajai/plantacadastral/plantacadastral.html" target="_blank" rel="noopener">Abrir Planta Cadastral ↗</a>
+            <a class="gp-btn primary" href="${plantaUrl}" target="_blank" rel="noopener">Abrir Planta Cadastral ↗</a>
           </div>
           <div class="gp-preset-card">
             <div>
-              <div class="gp-preset-title">Consulta Prévia de Zoneamento (2024)</div>
+              <div class="gp-preset-title">Consulta Prévia de Zoneamento</div>
               <div class="gp-preset-desc">Verifique parâmetros construtivos, índices urbanísticos e viabilidade conforme o Plano Diretor vigente.</div>
             </div>
-            <a class="gp-btn primary" href="https://arcgis.itajai.sc.gov.br/portal/apps/experiencebuilder/experience/?id=03284fdd05e04bcfbe1ab51d1801efb2" target="_blank" rel="noopener">Consulta Prévia Oficial ↗</a>
+            <a class="gp-btn primary" href="${zonaUrl}" target="_blank" rel="noopener">Consulta Prévia Oficial ↗</a>
           </div>
           <div class="gp-preset-card">
             <div>
@@ -1220,7 +1286,7 @@
               <div class="gp-preset-title">Portal Oficial GeoItajaí</div>
               <div class="gp-preset-desc">Acesse os dashboards temáticos, relatórios ambientais (INIS) e demais aplicativos municipais.</div>
             </div>
-            <a class="gp-btn" href="https://geo.itajai.sc.gov.br/" target="_blank" rel="noopener">Acessar geo.itajai.sc.gov.br ↗</a>
+            <a class="gp-btn" href="${portalUrl}" target="_blank" rel="noopener">${isOnline ? 'Acessar geo.itajai.sc.gov.br ↗' : 'Espelho GeoItajaí ↗'}</a>
           </div>
         </div>
       `;

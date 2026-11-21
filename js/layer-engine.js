@@ -1,20 +1,30 @@
 /**
- * Geoportal Itajaí — Motor de Camadas GIS (Ortofoto Completa com Recorte IBGE 4208203,
- * Satélite HD / Híbrido / Bing Aerial, Empilhamento Determinístico por Camada com Z-Index
- * Individual, Reordenação ↑/↓, Retry Automático de Tiles e Importação Local).
+ * Geoportal Itajaí — Motor de Camadas GIS Multi-Fonte com Contingência Automática.
+ *   - Sondagem inteligente de arcgis.itajai.sc.gov.br (timeout curto + cache compartilhado)
+ *   - Failover automático para espelhos verificados GeoItajaí / IBGE / DataSUS / OSM / Bundle local
+ *   - Reprojeção cliente SIRGAS 2000 UTM 22S (EPSG:31982 / 32722) -> WGS84 (EPSG:4326)
+ *   - Articulação Cadastral sob demanda (divisaolotes/exportMalha/*.geojson) + Tiles PD2019
+ *   - Recorte oficial IBGE 4208203, empilhamento determinístico e Raio-X ponto-em-polígono exato
  */
 window.GeoLayerEngine = (() => {
   const {
     BASEMAPS,
     TRANSPARENT_TILE,
+    ITAJAI_BOUNDS,
     buildServiceUrl,
     getLayerById,
   } = window.GeoCatalog;
 
+  const PARCEL_ARTIC_URL =
+    'https://raw.githubusercontent.com/geoitajai/desenveconomico/main/data/artic.json';
+  const PARCEL_TILE_URL =
+    'https://raw.githubusercontent.com/geoitajai/desenveconomico/main/data/divisaolotes/exportMalha';
+  const GITHUB_PAGES_BASE = 'https://eriksdhoffmann.github.io/Geoportal-Itajai';
+
   const HIDDEN_FIELDS = new Set([
     'objectid', 'fid', 'globalid', 'shape__area', 'shape__length',
     'shape_leng', 'shape_area', 'created_user', 'created_date',
-    'last_edited_user', 'last_edited_date', 'true_',
+    'last_edited_user', 'last_edited_date', 'true_', 'id',
   ]);
 
   const FIELD_LABELS = {
@@ -24,10 +34,12 @@ window.GeoLayerEngine = (() => {
     NM_CONCURB: 'Concentração Urbana',
     FONTE: 'Fonte',
     nome: 'Nome / Sigla',
+    abrev: 'Sigla',
     descr: 'Descrição',
-    legenda: 'Zona (2012)',
+    legenda: 'Zona / Classificação',
     memorial: 'Memorial Descritivo',
     inscricao: 'Inscrição Imobiliária',
+    inscrlig: 'Inscrição (Ligação)',
     setor: 'Setor',
     quadra: 'Quadra',
     face: 'Face',
@@ -39,11 +51,20 @@ window.GeoLayerEngine = (() => {
     loteamento: 'Loteamento',
     hierarquia: 'Hierarquia Viária',
     largura: 'Largura da Via (m)',
+    caixatotal: 'Caixa Total (m)',
+    caixavia: 'Caixa da Via (m)',
     passeiod: 'Passeio Direito (m)',
     passeioe: 'Passeio Esquerdo (m)',
+    passeionl: 'Passeio N/L (m)',
+    passeioso: 'Passeio S/O (m)',
     leidata: 'Legislação / Data',
+    lei: 'Legislação',
+    leinumero: 'Lei Municipal',
+    leidataano: 'Data / Ano da Lei',
     cota: 'Cota (m)',
     tipocurvan: 'Tipo de Curva',
+    situa: 'Lâmina / Situação',
+    situacao: 'Situação',
     rua_avenida: 'Logradouro',
     bairro: 'Bairro',
     endereco: 'Endereço',
@@ -58,19 +79,31 @@ window.GeoLayerEngine = (() => {
     classe: 'Classe',
     plan: 'Situação / Fase',
     secao_existente: 'Seção Existente',
-    unidade_de_saúde__no_ups_: 'Unidade de Saúde',
+    'unidade_de_saúde__no_ups_': 'Unidade de Saúde',
     logradouro: 'Logradouro',
-    número: 'Número',
+    'número': 'Número',
     mome: 'Escola / Unidade',
     categoria: 'Categoria',
     codigo_da_escola: 'Código',
     altmax: 'Altura Máxima',
+    alturamax: 'Altura Máxima',
+    alturaemb: 'Altura Embasamento',
+    coefaprov: 'Coef. Aproveitamento',
+    toemb: 'Taxa Ocup. Embasamento',
+    totorre: 'Taxa Ocup. Torre',
+    permitidos: 'Usos Permitidos',
+    permissiv: 'Usos Permissivos',
     empresa: 'Empresa Responsável',
     n_doc: 'Documento',
     data_sond: 'Data Sondagem',
     local_: 'Local do Marco',
+    alt_ortometrica: 'Altitude Ortométrica (m)',
     titulo: 'Título',
     descricao: 'Descrição',
+    equipamentos: 'Equipamentos',
+    Classificacao: 'Classificação',
+    Descricao_Contato: 'Descrição / Contato',
+    residuos: 'Resíduos Aceitos',
   };
 
   function prettyFieldName(key) {
@@ -84,6 +117,7 @@ window.GeoLayerEngine = (() => {
 
   function formatFieldValue(key, val) {
     if (val === null || val === undefined || val === '') return null;
+    if (Array.isArray(val)) return val.join(', ');
     if (typeof val === 'number') {
       if (key.toLowerCase().includes('data') && val > 100000000000) {
         return new Date(val).toLocaleDateString('pt-BR');
@@ -91,7 +125,7 @@ window.GeoLayerEngine = (() => {
       return Number.isInteger(val) ? val.toLocaleString('pt-BR') : val.toFixed(3).replace('.', ',');
     }
     const str = String(val).trim();
-    if (!str || str === 'null' || str === 'Null') return null;
+    if (!str || str === 'null' || str === 'Null' || str === 'undefined') return null;
     return str;
   }
 
@@ -101,6 +135,233 @@ window.GeoLayerEngine = (() => {
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
+  }
+
+  async function fetchWithTimeout(url, opts = {}, timeoutMs = 8000) {
+    const ctrl = new AbortController();
+    const extSignal = opts.signal;
+    if (extSignal?.aborted) {
+      ctrl.abort(extSignal.reason);
+    }
+    const onAbort = () => ctrl.abort(extSignal?.reason);
+    if (extSignal) extSignal.addEventListener('abort', onAbort, { once: true });
+    const timer = setTimeout(() => ctrl.abort(new DOMException('Tempo limite excedido', 'TimeoutError')), timeoutMs);
+    try {
+      return await fetch(url, { ...opts, signal: ctrl.signal });
+    } finally {
+      clearTimeout(timer);
+      if (extSignal) extSignal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  function extractFirstCoord(geom) {
+    if (!geom) return null;
+    if (geom.type === 'GeometryCollection') {
+      for (const g of geom.geometries || []) {
+        const c = extractFirstCoord(g);
+        if (c) return c;
+      }
+      return null;
+    }
+    let cur = geom.coordinates;
+    while (Array.isArray(cur) && Array.isArray(cur[0])) {
+      cur = cur[0];
+    }
+    if (Array.isArray(cur) && cur.length >= 2 && Number.isFinite(cur[0]) && Number.isFinite(cur[1])) {
+      return cur;
+    }
+    return null;
+  }
+
+  function convertCoordsRecursive(coords) {
+    if (!Array.isArray(coords)) return coords;
+    if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
+      const [x, y] = coords;
+      if ((Math.abs(x) > 180 || Math.abs(y) > 90) && window.GeoCoords?.utm22SToLatLon) {
+        const ll = window.GeoCoords.utm22SToLatLon(x, y);
+        return [Number(ll.lon.toFixed(6)), Number(ll.lat.toFixed(6))];
+      }
+      return coords.length > 2 ? [x, y] : coords;
+    }
+    return coords.map(convertCoordsRecursive);
+  }
+
+  function convertGeometryToWgs84(geom) {
+    if (!geom) return geom;
+    if (geom.type === 'GeometryCollection') {
+      return {
+        type: 'GeometryCollection',
+        geometries: (geom.geometries || []).map(convertGeometryToWgs84),
+      };
+    }
+    return {
+      ...geom,
+      coordinates: convertCoordsRecursive(geom.coordinates),
+    };
+  }
+
+  function normalizeGeoJsonToWgs84(raw) {
+    if (!raw) return { type: 'FeatureCollection', features: [] };
+    const fc = Array.isArray(raw)
+      ? { type: 'FeatureCollection', features: raw }
+      : raw;
+    const feats = fc.features || [];
+    if (!feats.length) return { type: 'FeatureCollection', features: [] };
+
+    let needsReproj = false;
+    const crsName = String(fc.crs?.properties?.name || '');
+    if (/31982|32722|29192/.test(crsName)) {
+      needsReproj = true;
+    } else {
+      for (let i = 0; i < Math.min(20, feats.length); i++) {
+        const sample = extractFirstCoord(feats[i]?.geometry);
+        if (sample && (Math.abs(sample[0]) > 180 || Math.abs(sample[1]) > 90)) {
+          needsReproj = true;
+          break;
+        }
+      }
+    }
+
+    if (!needsReproj) {
+      return { type: 'FeatureCollection', features: feats };
+    }
+
+    return {
+      type: 'FeatureCollection',
+      features: feats.map((f) => ({
+        ...f,
+        geometry: convertGeometryToWgs84(f.geometry),
+      })),
+    };
+  }
+
+  function applyFallbackTransform(geojson, cfg) {
+    const normalized = normalizeGeoJsonToWgs84(geojson);
+    const fb = cfg.fallback || {};
+    let feats = normalized.features || [];
+
+    if (fb.filterField && Array.isArray(fb.filterValues)) {
+      const allowed = new Set(fb.filterValues);
+      feats = feats.filter((f) => allowed.has(f.properties?.[fb.filterField]));
+    }
+    if (fb.filterArrayField && fb.filterValue !== undefined) {
+      feats = feats.filter((f) => {
+        const arr = f.properties?.[fb.filterArrayField];
+        return Array.isArray(arr) && arr.includes(fb.filterValue);
+      });
+    }
+
+    if (fb.normalizeProps === 'viario') {
+      feats = feats.map((f) => {
+        const p = f.properties || {};
+        return {
+          ...f,
+          properties: {
+            ...p,
+            nome: p.nome || p.nomevia || '',
+            largura: p.largura ?? p.caixatotal,
+            passeiod: p.passeiod ?? p.passeionl,
+            passeioe: p.passeioe ?? p.passeioso,
+          },
+        };
+      });
+    }
+
+    if (fb.parcelGrid) {
+      feats = feats.map((f) => {
+        const p = f.properties || {};
+        if (p.inscrlig && !p.inscricao) {
+          return {
+            ...f,
+            properties: {
+              ...p,
+              inscricao: p.inscrlig,
+            },
+          };
+        }
+        return f;
+      });
+    }
+
+    return { type: 'FeatureCollection', features: feats };
+  }
+
+  // ---- Geometria exata (ponto em polígono & distância a segmento) para Raio-X offline ----
+  function pointInRing(lon, lat, ring) {
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const xi = ring[i][0];
+      const yi = ring[i][1];
+      const xj = ring[j][0];
+      const yj = ring[j][1];
+      const intersect =
+        yi > lat !== yj > lat &&
+        lon < ((xj - xi) * (lat - yi)) / ((yj - yi) || 1e-12) + xi;
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  function pointInPolygonCoords(lon, lat, rings) {
+    if (!rings?.length || !pointInRing(lon, lat, rings[0])) return false;
+    for (let i = 1; i < rings.length; i++) {
+      if (pointInRing(lon, lat, rings[i])) return false;
+    }
+    return true;
+  }
+
+  function distPointToSegmentSq(px, py, ax, ay, bx, by) {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const lenSq = dx * dx + dy * dy;
+    let t = lenSq > 0 ? ((px - ax) * dx + (py - ay) * dy) / lenSq : 0;
+    t = Math.max(0, Math.min(1, t));
+    const cx = ax + t * dx;
+    const cy = ay + t * dy;
+    const ex = px - cx;
+    const ey = py - cy;
+    return ex * ex + ey * ey;
+  }
+
+  function pointNearLine(lon, lat, lineCoords, tolSq) {
+    for (let i = 0; i < lineCoords.length - 1; i++) {
+      const a = lineCoords[i];
+      const b = lineCoords[i + 1];
+      if (distPointToSegmentSq(lon, lat, a[0], a[1], b[0], b[1]) <= tolSq) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function geomContainsLatLng(geom, latlng, tolDeg) {
+    if (!geom) return false;
+    const lon = latlng.lng;
+    const lat = latlng.lat;
+    const tolSq = tolDeg * tolDeg;
+
+    switch (geom.type) {
+      case 'Polygon':
+        return pointInPolygonCoords(lon, lat, geom.coordinates);
+      case 'MultiPolygon':
+        return (geom.coordinates || []).some((poly) => pointInPolygonCoords(lon, lat, poly));
+      case 'Point': {
+        const [px, py] = geom.coordinates || [];
+        return (px - lon) * (px - lon) + (py - lat) * (py - lat) <= tolSq * 4;
+      }
+      case 'MultiPoint':
+        return (geom.coordinates || []).some(
+          ([px, py]) => (px - lon) * (px - lon) + (py - lat) * (py - lat) <= tolSq * 4
+        );
+      case 'LineString':
+        return pointNearLine(lon, lat, geom.coordinates || [], tolSq);
+      case 'MultiLineString':
+        return (geom.coordinates || []).some((line) => pointNearLine(lon, lat, line, tolSq));
+      case 'GeometryCollection':
+        return (geom.geometries || []).some((g) => geomContainsLatLng(g, latlng, tolDeg));
+      default:
+        return false;
+    }
   }
 
   // Subclasse TileLayer para Bing VirtualEarth QuadKey
@@ -119,24 +380,22 @@ window.GeoLayerEngine = (() => {
     },
   });
 
-  // TileLayer resiliente com retry automático (elimina buracos na Ortoimagem 2024!)
-  function attachTileRetry(tileLayer, maxRetries = 3) {
+  // TileLayer resiliente com retry automático para hosts confiáveis
+  function attachTileRetry(tileLayer, maxRetries = 2) {
     tileLayer.on('tileerror', (ev) => {
-      const tile = ev.tile;
-      if (!tile || !tile.src || tile.src.startsWith('data:')) return;
-      const attempt = Number(tile.dataset.retry || '0');
-      if (attempt >= maxRetries) {
-        // Deixa o tile transparente para revelar o Satélite HD contínuo por baixo
-        tile.src = TRANSPARENT_TILE;
-        return;
-      }
-      tile.dataset.retry = String(attempt + 1);
-      const orig = tile.dataset.origSrc || tile.src;
-      tile.dataset.origSrc = orig;
-      const sep = orig.includes('?') ? '&' : '?';
+      const img = ev.tile;
+      if (!img) return;
+      if (typeof tileLayer._retryAllowed === 'function' && !tileLayer._retryAllowed()) return;
+      const attempt = Number(img.dataset.retryCount || 0);
+      if (attempt >= maxRetries) return;
+      img.dataset.retryCount = String(attempt + 1);
+      const rawSrc = tileLayer.getTileUrl(ev.coords);
+      if (!rawSrc || rawSrc.startsWith('data:')) return;
+      const sep = rawSrc.includes('?') ? '&' : '?';
       setTimeout(() => {
-        tile.src = `${orig}${sep}_r=${attempt + 1}&t=${Date.now()}`;
-      }, 450 * (attempt + 1));
+        if (!img.isConnected) return;
+        img.src = `${rawSrc}${sep}_r=${attempt + 1}`;
+      }, 320 * (attempt + 1));
     });
     return tileLayer;
   }
@@ -145,23 +404,33 @@ window.GeoLayerEngine = (() => {
     const basemapLayers = new Map();
     const activeBasemaps = new Set();
     const activeLayers = new Map(); // id -> state
-    const layerOrder = []; // bottom -> top (cada camada tem seu próprio pane + zIndex!)
-    const dataCache = new Map();
+    const layerOrder = []; // bottom -> top
+    const dataCache = new Map(); // id -> { geojson, usingFallback, fallbackLabel }
+    const remoteRawCache = new Map(); // url -> parsed geojson
+    const parcelTileCache = new Map(); // nome -> Feature[]
     const userLayers = [];
 
+    let parcelGridIndex = null;
+    let parcelGridPromise = null;
+
+    // Estado de conectividade ao servidor oficial arcgis.itajai.sc.gov.br
+    let arcgisStatus = 'unknown'; // 'unknown' | 'checking' | 'online' | 'offline'
+    let arcgisCheckedAt = 0;
+    let arcgisProbePromise = null;
+    const PROBE_ONLINE_TTL = 120000;
+    const PROBE_OFFLINE_TTL = 60000;
+
     // Panes dedicados para arquitetura de empilhamento cristalina
-    map.createPane('paneBasemapUnderlay').style.zIndex = 195; // Esri Satélite sem buracos sob Ortofoto
+    map.createPane('paneBasemapUnderlay').style.zIndex = 195;
     map.createPane('paneBasemapGlobal').style.zIndex = 200;
     map.createPane('paneBasemapMunicipal').style.zIndex = 210;
     map.createPane('paneBasemapLabels').style.zIndex = 218;
     map.createPane('paneSwipeRight').style.zIndex = 222;
-    map.createPane('paneMunicipalMask').style.zIndex = 230; // Máscara branca oficial IBGE 4208203!
+    map.createPane('paneMunicipalMask').style.zIndex = 230;
     map.getPane('paneMunicipalMask').style.pointerEvents = 'none';
-    // Camadas vetoriais dinâmicas ocupam zIndex 410..598 (uma pane por camada!)
-    map.createPane('paneToolsOverlay').style.zIndex = 650; // Medição, Desenho e Destaques SEMPRE NO TOPO!
+    map.createPane('paneToolsOverlay').style.zIndex = 650;
 
-    // Underlay contínuo de Satélite HD (Esri World Imagery) que preenche 100% do polígono de Itajaí
-    // caso qualquer tile da Ortoimagem 2024 leve milissegundos a mais ou sofra throttling
+    // Underlay contínuo de Satélite HD (Esri World Imagery)
     const municipalSatUnderlay = attachTileRetry(
       L.tileLayer(
         'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
@@ -177,8 +446,66 @@ window.GeoLayerEngine = (() => {
       2
     );
 
+    // ---- Sondagem única deduplicada do servidor ArcGIS ----
+    async function ensureArcgisStatus(force = false) {
+      const now = Date.now();
+      if (!force) {
+        if (arcgisStatus === 'online' && now - arcgisCheckedAt < PROBE_ONLINE_TTL) return 'online';
+        if (arcgisStatus === 'offline' && now - arcgisCheckedAt < PROBE_OFFLINE_TTL) return 'offline';
+        if (arcgisProbePromise) return arcgisProbePromise;
+      }
+
+      const prevStatus = arcgisStatus;
+      arcgisStatus = 'checking';
+      callbacks.onStateChange?.();
+
+      arcgisProbePromise = (async () => {
+        try {
+          const probeUrl = `${buildServiceUrl('Hosted/bairros2025/FeatureServer/0')}?f=json`;
+          const resp = await fetchWithTimeout(probeUrl, { cache: 'no-store' }, 2800);
+          if (resp.ok) {
+            const json = await resp.json();
+            arcgisStatus = json && !json.error ? 'online' : 'offline';
+          } else {
+            arcgisStatus = 'offline';
+          }
+        } catch {
+          arcgisStatus = 'offline';
+        } finally {
+          arcgisCheckedAt = Date.now();
+          arcgisProbePromise = null;
+        }
+
+        if (prevStatus !== arcgisStatus) {
+          syncBasemapsForStatus();
+        }
+        callbacks.onStateChange?.();
+        return arcgisStatus;
+      })();
+
+      return arcgisProbePromise;
+    }
+
+    async function recheckArcgisServer() {
+      const status = await ensureArcgisStatus(true);
+      if (status === 'online') {
+        callbacks.onToast?.('Servidor oficial arcgis.itajai.sc.gov.br acessível! Atualizando camadas...', 'success');
+        for (const [id, st] of activeLayers) {
+          if (st.usingFallback || st.offlineBlocked || st.error) {
+            dataCache.delete(id);
+            loadOrRefreshLayer(id, { notifyZoom: false });
+          }
+        }
+      } else {
+        callbacks.onToast?.(
+          'Servidor arcgis.itajai.sc.gov.br continua inacessível (DNS/rede municipal). Mantendo modo de contingência.',
+          'info'
+        );
+      }
+      return status;
+    }
+
     // ---- Máscara Oficial do Limite de Itajaí (IBGE 4208203_Itajai.gpkg) ----
-    // Recorta qualquer base aérea/satélite no contorno exato de Itajaí (sem serrilhado preto!)
     let municipalClipEnabled = true;
     let municipalMaskLayer = null;
 
@@ -193,7 +520,6 @@ window.GeoLayerEngine = (() => {
         [85, -180],
         [-85, -180],
       ];
-      // Converte MultiPolygon GeoJSON [lon, lat] em buracos [lat, lon] dentro do retângulo mundial
       const holes = [];
       const polys = geom.type === 'MultiPolygon' ? geom.coordinates : [geom.coordinates];
       for (const poly of polys) {
@@ -212,7 +538,6 @@ window.GeoLayerEngine = (() => {
         interactive: false,
       }).addTo(group);
 
-      // Contorno vetorial fino e nítido acompanhando o limite exato de 4208203_Itajai.gpkg
       for (const ring of holes) {
         L.polyline(ring, {
           pane: 'paneMunicipalMask',
@@ -235,14 +560,12 @@ window.GeoLayerEngine = (() => {
         return b?.hasSatelliteUnderlay;
       });
 
-      // Underlay contínuo de satélite só fica ligado sob ortofoto oficial para evitar qualquer buraco
       if (hasMunicipalBm) {
         if (!map.hasLayer(municipalSatUnderlay)) municipalSatUnderlay.addTo(map);
       } else {
         if (map.hasLayer(municipalSatUnderlay)) map.removeLayer(municipalSatUnderlay);
       }
 
-      // Máscara branca de recorte IBGE 4208203
       if (municipalClipEnabled && activeBasemaps.size > 0) {
         if (!map.hasLayer(municipalMaskLayer)) municipalMaskLayer.addTo(map);
       } else {
@@ -260,16 +583,13 @@ window.GeoLayerEngine = (() => {
       return municipalClipEnabled;
     }
 
-    // ---- Construção de Basemaps ----
-    function ensureBasemapLayer(bmCfg, customPane = null) {
-      if (!customPane && basemapLayers.has(bmCfg.id)) {
-        return basemapLayers.get(bmCfg.id);
-      }
+    // ---- Construção de Basemaps (com fallback automático quando host ArcGIS está offline) ----
+    function buildTileOpts(bmCfg, customPane, useFallback = false) {
       const pane = customPane || (bmCfg.isMunicipalClip ? 'paneBasemapMunicipal' : 'paneBasemapGlobal');
       const opts = {
         minZoom: bmCfg.minZoom || 5,
         maxZoom: bmCfg.maxZoom || 21,
-        maxNativeZoom: bmCfg.maxNativeZoom || 19,
+        maxNativeZoom: useFallback ? (bmCfg.fallbackMaxNativeZoom || 16) : (bmCfg.maxNativeZoom || 19),
         attribution: bmCfg.attribution || '',
         pane,
         opacity: 1,
@@ -277,13 +597,17 @@ window.GeoLayerEngine = (() => {
         updateWhenIdle: false,
       };
       if (bmCfg.bounds) opts.bounds = bmCfg.bounds;
-      if (bmCfg.subdomains) opts.subdomains = bmCfg.subdomains;
+      if (bmCfg.subdomains && !useFallback) opts.subdomains = bmCfg.subdomains;
       if (bmCfg.errorTileUrl) opts.errorTileUrl = bmCfg.errorTileUrl;
+      return opts;
+    }
 
-      let layer;
+    function buildSingleBasemapLayer(bmCfg, customPane = null) {
       if (bmCfg.type === 'bing') {
-        layer = attachTileRetry(new BingTileLayer(bmCfg.url, opts), 2);
-      } else if (bmCfg.overlayUrls?.length) {
+        return attachTileRetry(new BingTileLayer(bmCfg.url, buildTileOpts(bmCfg, customPane, false)), 2);
+      }
+      if (bmCfg.overlayUrls?.length) {
+        const opts = buildTileOpts(bmCfg, customPane, false);
         const grp = L.layerGroup();
         attachTileRetry(L.tileLayer(bmCfg.url, opts), 2).addTo(grp);
         for (const ovUrl of bmCfg.overlayUrls) {
@@ -296,11 +620,62 @@ window.GeoLayerEngine = (() => {
             1
           ).addTo(grp);
         }
-        layer = grp;
-      } else {
-        layer = attachTileRetry(L.tileLayer(bmCfg.url, opts), 3);
+        return grp;
       }
 
+      if (bmCfg.requiresArcgisHost) {
+        if (arcgisStatus === 'online') {
+          const tl = L.tileLayer(bmCfg.url, buildTileOpts(bmCfg, customPane, false));
+          tl._retryAllowed = () => arcgisStatus === 'online';
+          tl._sourceMode = 'live';
+          return attachTileRetry(tl, 2);
+        }
+        if (arcgisStatus === 'unknown' || arcgisStatus === 'checking') {
+          ensureArcgisStatus();
+        }
+        if (bmCfg.fallbackUrl) {
+          const tl = L.tileLayer(bmCfg.fallbackUrl, buildTileOpts(bmCfg, customPane, true));
+          tl._sourceMode = 'fallback';
+          return attachTileRetry(tl, 1);
+        }
+        // Em contingência para ortofotos sem espelho de tiles (ex: Orto 2024),
+        // evita disparar centenas de requisições a host inacessível e exibe Esri HD contínuo.
+        if (customPane) {
+          return L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            buildTileOpts({ ...bmCfg, maxNativeZoom: 19 }, customPane, false)
+          );
+        }
+        const noop = L.layerGroup();
+        noop._sourceMode = 'underlay';
+        return noop;
+      }
+
+      return attachTileRetry(L.tileLayer(bmCfg.url, buildTileOpts(bmCfg, customPane, false)), 2);
+    }
+
+    function syncBasemapsForStatus() {
+      for (const bmId of [...activeBasemaps]) {
+        const bmCfg = BASEMAPS.find((b) => b.id === bmId);
+        if (!bmCfg?.requiresArcgisHost) continue;
+        const oldLayer = basemapLayers.get(bmId);
+        const desiredMode = arcgisStatus === 'online' ? 'live' : bmCfg.fallbackUrl ? 'fallback' : 'underlay';
+        if (oldLayer?._sourceMode === desiredMode) continue;
+
+        if (oldLayer && map.hasLayer(oldLayer)) map.removeLayer(oldLayer);
+        basemapLayers.delete(bmId);
+        const fresh = buildSingleBasemapLayer(bmCfg, null);
+        basemapLayers.set(bmId, fresh);
+        fresh.addTo(map);
+      }
+      syncMunicipalMask();
+    }
+
+    function ensureBasemapLayer(bmCfg, customPane = null) {
+      if (!customPane && basemapLayers.has(bmCfg.id)) {
+        return basemapLayers.get(bmCfg.id);
+      }
+      const layer = buildSingleBasemapLayer(bmCfg, customPane);
       if (!customPane) basemapLayers.set(bmCfg.id, layer);
       return layer;
     }
@@ -328,6 +703,7 @@ window.GeoLayerEngine = (() => {
         activeBasemaps.delete(bmId);
       }
       syncMunicipalMask();
+      callbacks.onBasemapChange?.(bmCfg, enabled);
       callbacks.onStateChange?.();
     }
 
@@ -346,7 +722,6 @@ window.GeoLayerEngine = (() => {
     }
 
     function syncLayerZIndexes() {
-      // Base começa em 410; cada camada sobe +4 garantindo espaço para rótulos (+2)
       for (let i = 0; i < layerOrder.length; i++) {
         const id = layerOrder[i];
         const st = activeLayers.get(id);
@@ -359,7 +734,6 @@ window.GeoLayerEngine = (() => {
     }
 
     function moveLayerOrder(layerId, direction) {
-      // direction: 'up' (mais à frente / topo), 'down' (mais atrás / fundo), 'top', 'bottom'
       const idx = layerOrder.indexOf(layerId);
       if (idx === -1) return;
       if (direction === 'up' && idx < layerOrder.length - 1) {
@@ -378,23 +752,35 @@ window.GeoLayerEngine = (() => {
     }
 
     function getOrderedActiveLayers() {
-      // Retorna do TOPO (frente) para a BASE (fundo) para exibição natural na UI
       return [...layerOrder]
         .reverse()
         .map((id) => activeLayers.get(id))
         .filter(Boolean);
     }
 
+    function getEffectiveColorMap(cfg, state) {
+      if (state?.usingFallback && cfg.fallback?.colorMap) return cfg.fallback.colorMap;
+      return cfg.colorMap || null;
+    }
+
+    function getEffectiveTitleField(cfg, state) {
+      if (state?.usingFallback && cfg.fallback?.titleField) return cfg.fallback.titleField;
+      return cfg.titleField;
+    }
+
     // ---- Estilização e Popups ----
-    function computeFeatureStyle(cfg, feature, opacityOverride) {
+    function computeFeatureStyle(cfg, feature, opacityOverride, stateRef = null) {
       const op = opacityOverride ?? cfg.opacity ?? 0.65;
       const props = feature?.properties || {};
+      const colorMap = getEffectiveColorMap(cfg, stateRef);
+      const actualType = feature?.geometry?.type || '';
+      const isLine = actualType ? actualType.includes('Line') : cfg.geomType === 'line';
 
-      if (cfg.geomType === 'line') {
+      if (isLine) {
         let color = cfg.style?.color || '#2563eb';
-        if (cfg.colorField && cfg.colorMap) {
+        if (cfg.colorField && colorMap) {
           const val = props[cfg.colorField];
-          color = cfg.colorMap[val] || color;
+          color = colorMap[val] || color;
         }
         return {
           color,
@@ -408,9 +794,9 @@ window.GeoLayerEngine = (() => {
       let color = cfg.style?.color || '#1e293b';
       let fillOpacity = cfg.outlineMode ? (cfg.style?.fillOpacity ?? 0.02) : op;
 
-      if (cfg.colorField && cfg.colorMap) {
+      if (cfg.colorField && colorMap) {
         const raw = props[cfg.colorField];
-        const mapped = cfg.colorMap[raw];
+        const mapped = colorMap[raw];
         if (mapped) {
           fillColor = mapped;
           color = '#2b3440';
@@ -427,14 +813,15 @@ window.GeoLayerEngine = (() => {
       };
     }
 
-    function buildFeaturePopupHtml(cfg, feature) {
+    function buildFeaturePopupHtml(cfg, feature, stateRef = null) {
       const props = feature?.properties || {};
-      const titleVal = cfg.titleField ? formatFieldValue(cfg.titleField, props[cfg.titleField]) : null;
+      const titleField = getEffectiveTitleField(cfg, stateRef);
+      const titleVal = titleField ? formatFieldValue(titleField, props[titleField]) : null;
       const heading = titleVal ? `${escapeHtml(cfg.name)} — ${escapeHtml(titleVal)}` : escapeHtml(cfg.name);
 
       const rows = [];
       const shown = new Set();
-      if (cfg.titleField) shown.add(cfg.titleField.toLowerCase());
+      if (titleField) shown.add(titleField.toLowerCase());
 
       for (const f of cfg.subtitleFields || []) {
         const val = formatFieldValue(f, props[f]);
@@ -454,11 +841,17 @@ window.GeoLayerEngine = (() => {
         }
       }
 
-      const insc = props.inscricao || props.INSCRICAO;
+      if (stateRef?.usingFallback && stateRef.fallbackLabel) {
+        rows.push(
+          `<tr><th>Fonte ativa</th><td>${escapeHtml(stateRef.fallbackLabel)} (Contingência)</td></tr>`
+        );
+      }
+
+      const insc = props.inscricao || props.INSCRICAO || props.inscrlig;
       const extraLink = insc
         ? `<div class="geo-popup-actions">
-             <a class="geo-popup-btn" href="https://arcgis.itajai.sc.gov.br/geoitajai/plantacadastral/plantacadastral.html" target="_blank" rel="noopener">
-               Abrir Planta Cadastral Oficial ↗
+             <a class="geo-popup-btn" href="https://geoitajai.github.io/desenveconomico/plantacadastral.html" target="_blank" rel="noopener">
+               Abrir Planta Cadastral GeoItajaí ↗
              </a>
            </div>`
         : '';
@@ -473,15 +866,14 @@ window.GeoLayerEngine = (() => {
         </div>`;
     }
 
-    function buildGeoJsonLayer(cfg, geojson, opacity, paneName) {
-      // Cada camada usa seu próprio Canvas renderer dentro da sua própria pane!
-      // Assim a ordem das camadas é 100% determinística e nunca se embaralha.
+    function buildGeoJsonLayer(cfg, geojson, opacity, paneName, stateRef = null) {
       const layerRenderer = L.canvas({ pane: paneName, padding: 0.45 });
+      const titleField = getEffectiveTitleField(cfg, stateRef);
 
       return L.geoJSON(geojson, {
         pane: paneName,
         renderer: layerRenderer,
-        style: (feature) => computeFeatureStyle(cfg, feature, opacity),
+        style: (feature) => computeFeatureStyle(cfg, feature, opacity, stateRef),
         pointToLayer: (feature, latlng) => {
           const ps = cfg.pointStyle || {
             radius: 6,
@@ -499,8 +891,9 @@ window.GeoLayerEngine = (() => {
           });
         },
         onEachFeature: (feature, layer) => {
-          if (cfg.titleField && feature.properties?.[cfg.titleField]) {
-            const lbl = String(feature.properties[cfg.titleField]).trim();
+          const labelVal = titleField ? feature.properties?.[titleField] : null;
+          if (labelVal) {
+            const lbl = String(labelVal).trim();
             if (lbl) {
               layer.bindTooltip(escapeHtml(lbl), {
                 sticky: true,
@@ -515,7 +908,7 @@ window.GeoLayerEngine = (() => {
             L.DomEvent.stopPropagation(ev);
             L.popup({ maxWidth: 360, className: 'geo-custom-popup' })
               .setLatLng(ev.latlng)
-              .setContent(buildFeaturePopupHtml(cfg, feature))
+              .setContent(buildFeaturePopupHtml(cfg, feature, stateRef))
               .openOn(map);
           });
         },
@@ -536,7 +929,9 @@ window.GeoLayerEngine = (() => {
           const tmp = L.geoJSON(feat);
           const bounds = tmp.getBounds();
           if (!bounds.isValid()) continue;
-          const span = Math.abs(bounds.getEast() - bounds.getWest()) + Math.abs(bounds.getNorth() - bounds.getSouth());
+          const span =
+            Math.abs(bounds.getEast() - bounds.getWest()) +
+            Math.abs(bounds.getNorth() - bounds.getSouth());
           if (cfg.id !== 'bairros_2025' && span < 0.008) continue;
           if (cfg.id === 'bairros_2025' && placed.has(key)) continue;
           placed.add(key);
@@ -580,7 +975,7 @@ window.GeoLayerEngine = (() => {
           params.set('spatialRel', 'esriSpatialRelIntersects');
         }
 
-        const resp = await fetch(`${baseUrl}/query?${params.toString()}`, { signal, cache: 'no-store' });
+        const resp = await fetchWithTimeout(`${baseUrl}/query?${params.toString()}`, { signal, cache: 'no-store' }, 9500);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const json = await resp.json();
         if (json.error) throw new Error(json.error.message || 'Erro no serviço ArcGIS');
@@ -595,27 +990,240 @@ window.GeoLayerEngine = (() => {
       return { type: 'FeatureCollection', features: allFeatures };
     }
 
+    // ---- Articulação Cadastral GeoItajaí (exportMalha sob demanda) ----
+    async function ensureParcelGridIndex(signal = null) {
+      if (parcelGridIndex) return parcelGridIndex;
+      if (parcelGridPromise) return parcelGridPromise;
+
+      parcelGridPromise = (async () => {
+        const resp = await fetchWithTimeout(PARCEL_ARTIC_URL, { signal }, 9000);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        parcelGridIndex = await resp.json();
+        return parcelGridIndex;
+      })();
+
+      try {
+        return await parcelGridPromise;
+      } finally {
+        parcelGridPromise = null;
+      }
+    }
+
+    async function loadGeoItajaiParcelGrid(bbox, signal = null) {
+      const idx = await ensureParcelGridIndex(signal);
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+      const south = bbox.getSouth();
+      const north = bbox.getNorth();
+      const west = bbox.getWest();
+      const east = bbox.getEast();
+      const cLat = (south + north) / 2;
+      const cLon = (west + east) / 2;
+
+      const matching = idx
+        .filter(
+          (cell) =>
+            cell.ne?.[0] >= south &&
+            cell.sw?.[0] <= north &&
+            cell.ne?.[1] >= west &&
+            cell.sw?.[1] <= east
+        )
+        .sort((a, b) => {
+          const da = Math.hypot((a.sw[0] + a.ne[0]) / 2 - cLat, (a.sw[1] + a.ne[1]) / 2 - cLon);
+          const db = Math.hypot((b.sw[0] + b.ne[0]) / 2 - cLat, (b.sw[1] + b.ne[1]) / 2 - cLon);
+          return da - db;
+        })
+        .slice(0, 12);
+
+      const results = await Promise.all(
+        matching.map(async (cell) => {
+          if (parcelTileCache.has(cell.nome)) return parcelTileCache.get(cell.nome);
+          try {
+            const resp = await fetchWithTimeout(`${PARCEL_TILE_URL}/${cell.nome}.geojson`, { signal }, 10000);
+            if (!resp.ok) {
+              parcelTileCache.set(cell.nome, []);
+              return [];
+            }
+            const raw = await resp.json();
+            const arr = Array.isArray(raw) ? raw : raw?.features || [];
+            parcelTileCache.set(cell.nome, arr);
+            return arr;
+          } catch (err) {
+            if (err.name === 'AbortError') throw err;
+            return [];
+          }
+        })
+      );
+
+      const seen = new Set();
+      const merged = [];
+      for (const arr of results) {
+        for (const f of arr) {
+          const p = f.properties || {};
+          const coord = extractFirstCoord(f.geometry);
+          const key = `${p.inscrlig || p.inscricao || ''}:${coord?.[0] || ''}:${coord?.[1] || ''}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          merged.push(f);
+          if (merged.length >= 4500) break;
+        }
+        if (merged.length >= 4500) break;
+      }
+      return { type: 'FeatureCollection', features: merged };
+    }
+
+    async function fetchRemoteGeoJson(url, signal) {
+      if (remoteRawCache.has(url)) return remoteRawCache.get(url);
+      const isFileProto = window.location.protocol === 'file:';
+      const targetUrl =
+        !url.startsWith('http') && isFileProto ? `${GITHUB_PAGES_BASE}/${url}` : url;
+
+      const resp = await fetchWithTimeout(targetUrl, { signal }, 12000);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const json = await resp.json();
+      remoteRawCache.set(url, json);
+      return json;
+    }
+
+    async function loadFallbackLayer(state, signal) {
+      const { cfg } = state;
+      const fb = cfg.fallback;
+      if (!fb) throw new Error('Sem fonte alternativa configurada');
+
+      // 1. Raster Tiles Fallback (ex: PD2019 GeoItajaí)
+      if (fb.tileUrl) {
+        clearStateMapObjects(state);
+        const { paneName } = state;
+        const tileOpacity = state.opacity ?? fb.tileOpacity ?? 0.72;
+        const tl = attachTileRetry(
+          L.tileLayer(fb.tileUrl, {
+            pane: paneName,
+            minZoom: 10,
+            maxNativeZoom: fb.tileMaxNativeZoom || 16,
+            maxZoom: 21,
+            bounds: ITAJAI_BOUNDS,
+            opacity: tileOpacity,
+            errorTileUrl: TRANSPARENT_TILE,
+            keepBuffer: 4,
+          }),
+          1
+        );
+        tl.addTo(map);
+        state.tileOverlay = tl;
+        state.leafletLayer = null;
+        state.labelGroup = null;
+        state.geojson = null;
+        state.count = 0;
+        state.loading = false;
+        state.error = null;
+        state.offlineBlocked = false;
+        state.usingFallback = true;
+        state.isTileFallback = true;
+        state.fallbackLabel = fb.label || 'Tiles GeoItajaí';
+        syncLayerZIndexes();
+        callbacks.onStateChange?.();
+        return;
+      }
+
+      // 2. Articulação Cadastral (parcelGrid)
+      if (fb.parcelGrid) {
+        const bbox = map.getBounds().pad(0.08);
+        const rawFc = await loadGeoItajaiParcelGrid(bbox, signal);
+        if (signal.aborted || !activeLayers.has(cfg.id)) return;
+        const gj = applyFallbackTransform(rawFc, cfg);
+        attachLayerData(state, gj, { usingFallback: true, fallbackLabel: fb.label || 'Articulação Cadastral' });
+        return;
+      }
+
+      // 3. Bundle embarcado instantâneo (funciona em 0ms tanto em file:// quanto https://)
+      if (fb.bundleKey && window.GEOITAJAI_BUNDLE?.[fb.bundleKey]) {
+        const gj = applyFallbackTransform(window.GEOITAJAI_BUNDLE[fb.bundleKey], cfg);
+        attachLayerData(state, gj, { usingFallback: true, fallbackLabel: fb.label || 'Contingência Local' });
+        return;
+      }
+
+      // 4. Lista de URLs remotas / relativas CORS
+      const candidateUrls = [...(fb.urls || [])];
+      if (window.location.protocol === 'file:') {
+        // Garante tentativa no GitHub Pages caso urls só tenha path relativo
+        for (const u of [...candidateUrls]) {
+          if (!u.startsWith('http')) {
+            const ghUrl = `${GITHUB_PAGES_BASE}/${u}`;
+            if (!candidateUrls.includes(ghUrl)) candidateUrls.push(ghUrl);
+          }
+        }
+      }
+
+      let lastErr = null;
+      for (const u of candidateUrls) {
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        try {
+          const raw = await fetchRemoteGeoJson(u, signal);
+          if (signal.aborted || !activeLayers.has(cfg.id)) return;
+          const gj = applyFallbackTransform(raw, cfg);
+          if (!cfg.viewportMode && !fb.ignoreCache) {
+            dataCache.set(cfg.id, {
+              geojson: gj,
+              usingFallback: true,
+              fallbackLabel: fb.label || 'GeoItajaí (Contingência)',
+            });
+          }
+          attachLayerData(state, gj, {
+            usingFallback: true,
+            fallbackLabel: fb.label || 'GeoItajaí (Contingência)',
+          });
+          return;
+        } catch (err) {
+          if (err.name === 'AbortError') throw err;
+          lastErr = err;
+        }
+      }
+
+      throw lastErr || new Error('Fontes alternativas indisponíveis');
+    }
+
+    function clearStateMapObjects(state) {
+      if (state.leafletLayer && map.hasLayer(state.leafletLayer)) {
+        map.removeLayer(state.leafletLayer);
+      }
+      if (state.labelGroup && map.hasLayer(state.labelGroup)) {
+        map.removeLayer(state.labelGroup);
+      }
+      if (state.tileOverlay && map.hasLayer(state.tileOverlay)) {
+        map.removeLayer(state.tileOverlay);
+      }
+      state.leafletLayer = null;
+      state.labelGroup = null;
+      state.tileOverlay = null;
+    }
+
     async function enableLayer(layerId) {
       if (activeLayers.has(layerId)) return;
 
-      // 1. Camada importada pelo usuário
       const userL = userLayers.find((u) => u.id === layerId);
       if (userL) {
         const { paneName } = getOrCreateLayerPane(layerId);
         layerOrder.push(layerId);
-        const gl = buildGeoJsonLayer(userL, userL.geojson, userL.opacity, paneName);
-        gl.addTo(map);
-        activeLayers.set(layerId, {
+        const st = {
           cfg: userL,
           paneName,
-          leafletLayer: gl,
+          leafletLayer: null,
           labelGroup: null,
+          tileOverlay: null,
           geojson: userL.geojson,
           opacity: userL.opacity,
           loading: false,
           zoomBlocked: false,
+          offlineBlocked: false,
+          usingFallback: false,
+          isTileFallback: false,
+          error: null,
           count: userL.geojson.features.length,
-        });
+        };
+        activeLayers.set(layerId, st);
+        const gl = buildGeoJsonLayer(userL, userL.geojson, userL.opacity, paneName, st);
+        gl.addTo(map);
+        st.leafletLayer = gl;
         syncLayerZIndexes();
         callbacks.onStateChange?.();
         return;
@@ -626,17 +1234,21 @@ window.GeoLayerEngine = (() => {
       const { layer: cfg } = found;
       const { paneName } = getOrCreateLayerPane(layerId);
 
-      // Nova camada sempre entra NO TOPO (acima das anteriores!)
       layerOrder.push(layerId);
       const state = {
         cfg,
         paneName,
         leafletLayer: null,
         labelGroup: null,
+        tileOverlay: null,
         geojson: null,
         opacity: cfg.opacity ?? 0.7,
         loading: false,
         zoomBlocked: false,
+        offlineBlocked: false,
+        usingFallback: false,
+        isTileFallback: false,
+        fallbackLabel: null,
         error: null,
         count: 0,
         controller: null,
@@ -644,9 +1256,8 @@ window.GeoLayerEngine = (() => {
       activeLayers.set(layerId, state);
       syncLayerZIndexes();
 
-      // Camada local embutida (ex: Limite Municipal Oficial IBGE 4208203)
       if (cfg.isLocalData && cfg.id === 'limite_municipal_ibge' && window.ITAJAI_LIMIT_GEOJSON) {
-        attachLayerData(state, window.ITAJAI_LIMIT_GEOJSON);
+        attachLayerData(state, window.ITAJAI_LIMIT_GEOJSON, { usingFallback: false });
         return;
       }
 
@@ -658,25 +1269,13 @@ window.GeoLayerEngine = (() => {
       if (!state || state.cfg.isUserLayer || state.cfg.isLocalData) return;
       const { cfg } = state;
 
-      if (cfg.viewportMode && cfg.minZoom && map.getZoom() < cfg.minZoom) {
-        if (state.leafletLayer && map.hasLayer(state.leafletLayer)) {
-          map.removeLayer(state.leafletLayer);
-          state.leafletLayer = null;
-        }
-        state.zoomBlocked = true;
-        state.loading = false;
-        state.error = null;
-        callbacks.onStateChange?.();
-        if (notifyZoom) {
-          callbacks.onZoomHint?.(cfg);
-        }
-        return;
-      }
-
-      state.zoomBlocked = false;
-
+      // Verifica cache primeiro (camadas não dependentes de viewport)
       if (!cfg.viewportMode && dataCache.has(layerId)) {
-        attachLayerData(state, dataCache.get(layerId));
+        const cached = dataCache.get(layerId);
+        attachLayerData(state, cached.geojson, {
+          usingFallback: cached.usingFallback,
+          fallbackLabel: cached.fallbackLabel,
+        });
         return;
       }
 
@@ -685,33 +1284,108 @@ window.GeoLayerEngine = (() => {
       state.controller = controller;
       state.loading = true;
       state.error = null;
+      state.offlineBlocked = false;
+      state.zoomBlocked = false;
       callbacks.onStateChange?.();
 
       try {
-        const bbox = cfg.viewportMode ? map.getBounds().pad(0.15) : null;
-        const gj = await queryFeatureServer(cfg, { bbox, signal: controller.signal });
-        if (!activeLayers.has(layerId)) return;
-        if (!cfg.viewportMode) dataCache.set(layerId, gj);
-        attachLayerData(state, gj);
+        const status = await ensureArcgisStatus();
+        if (controller.signal.aborted || !activeLayers.has(layerId)) return;
+
+        if (status === 'online') {
+          if (cfg.viewportMode && cfg.minZoom && map.getZoom() < cfg.minZoom) {
+            clearStateMapObjects(state);
+            state.zoomBlocked = true;
+            state.loading = false;
+            callbacks.onStateChange?.();
+            if (notifyZoom) callbacks.onZoomHint?.(cfg);
+            return;
+          }
+
+          try {
+            const bbox = cfg.viewportMode ? map.getBounds().pad(0.15) : null;
+            const gj = await queryFeatureServer(cfg, { bbox, signal: controller.signal });
+            if (controller.signal.aborted || !activeLayers.has(layerId)) return;
+            if (!cfg.viewportMode) {
+              dataCache.set(layerId, { geojson: gj, usingFallback: false, fallbackLabel: null });
+            }
+            attachLayerData(state, gj, { usingFallback: false, fallbackLabel: null });
+            return;
+          } catch (liveErr) {
+            if (liveErr.name === 'AbortError' || controller.signal.aborted) return;
+            if (!cfg.fallback) {
+              if (cfg.liveOnly) {
+                clearStateMapObjects(state);
+                state.loading = false;
+                state.offlineBlocked = true;
+                state.error = cfg.offlineNote || liveErr.message;
+                callbacks.onStateChange?.();
+                callbacks.onToast?.(state.error, 'info');
+                return;
+              }
+              throw liveErr;
+            }
+            // Se falhou ao vivo mas possui contingência configurada, segue para fallback!
+          }
+        }
+
+        // Modo Contingência (arcgis.itajai.sc.gov.br offline ou erro na consulta ao vivo)
+        if (cfg.liveOnly) {
+          clearStateMapObjects(state);
+          state.loading = false;
+          state.offlineBlocked = true;
+          state.usingFallback = false;
+          state.error =
+            cfg.offlineNote ||
+            `"${cfg.name}" depende exclusivamente do servidor oficial arcgis.itajai.sc.gov.br (atualmente indisponível).`;
+          callbacks.onStateChange?.();
+          if (notifyZoom) {
+            callbacks.onToast?.(state.error, 'info');
+          }
+          return;
+        }
+
+        if (cfg.fallback) {
+          const enforceZoom =
+            cfg.viewportMode &&
+            cfg.minZoom &&
+            !cfg.fallback.ignoreMinZoomOnFallback &&
+            map.getZoom() < cfg.minZoom;
+
+          if (enforceZoom) {
+            clearStateMapObjects(state);
+            state.zoomBlocked = true;
+            state.loading = false;
+            callbacks.onStateChange?.();
+            if (notifyZoom) callbacks.onZoomHint?.(cfg);
+            return;
+          }
+
+          await loadFallbackLayer(state, controller.signal);
+          return;
+        }
+
+        throw new Error('Servidor oficial indisponível e camada sem contingência.');
       } catch (err) {
-        if (err.name === 'AbortError') return;
+        if (err.name === 'AbortError' || controller.signal.aborted) return;
+        clearStateMapObjects(state);
         state.loading = false;
         state.error = err.message || 'Falha ao carregar camada';
         callbacks.onStateChange?.();
-        callbacks.onToast?.(`Erro ao carregar "${cfg.name}": ${state.error}`, 'error');
+        callbacks.onToast?.(`Não foi possível carregar "${cfg.name}": ${state.error}`, 'error');
       }
     }
 
-    function attachLayerData(state, geojson) {
+    function attachLayerData(state, geojson, meta = {}) {
       const { cfg, paneName } = state;
-      if (state.leafletLayer && map.hasLayer(state.leafletLayer)) {
-        map.removeLayer(state.leafletLayer);
-      }
-      if (state.labelGroup && map.hasLayer(state.labelGroup)) {
-        map.removeLayer(state.labelGroup);
-      }
+      clearStateMapObjects(state);
 
-      const gl = buildGeoJsonLayer(cfg, geojson, state.opacity, paneName);
+      state.usingFallback = Boolean(meta.usingFallback);
+      state.isTileFallback = false;
+      state.fallbackLabel = meta.fallbackLabel || null;
+      state.offlineBlocked = false;
+
+      const gl = buildGeoJsonLayer(cfg, geojson, state.opacity, paneName, state);
       gl.addTo(map);
 
       let lg = null;
@@ -734,8 +1408,7 @@ window.GeoLayerEngine = (() => {
       const state = activeLayers.get(layerId);
       if (!state) return;
       if (state.controller) state.controller.abort();
-      if (state.leafletLayer && map.hasLayer(state.leafletLayer)) map.removeLayer(state.leafletLayer);
-      if (state.labelGroup && map.hasLayer(state.labelGroup)) map.removeLayer(state.labelGroup);
+      clearStateMapObjects(state);
       activeLayers.delete(layerId);
       const idx = layerOrder.indexOf(layerId);
       if (idx !== -1) layerOrder.splice(idx, 1);
@@ -755,12 +1428,15 @@ window.GeoLayerEngine = (() => {
       const state = activeLayers.get(layerId);
       if (!state) return;
       state.opacity = opacity;
+      if (state.tileOverlay && typeof state.tileOverlay.setOpacity === 'function') {
+        state.tileOverlay.setOpacity(opacity);
+      }
       if (state.leafletLayer) {
         state.leafletLayer.eachLayer((sub) => {
-          if (state.cfg.geomType === 'point' && sub.setStyle) {
-            sub.setStyle({ fillOpacity: opacity, opacity });
+          if (sub instanceof L.CircleMarker) {
+            sub.setStyle({ fillOpacity: Math.min(1, opacity), opacity: Math.min(1, opacity) });
           } else if (sub.setStyle) {
-            sub.setStyle(computeFeatureStyle(state.cfg, sub.feature, opacity));
+            sub.setStyle(computeFeatureStyle(state.cfg, sub.feature, opacity, state));
           }
         });
       }
@@ -779,7 +1455,7 @@ window.GeoLayerEngine = (() => {
         map.setView(window.GeoCatalog.ITAJAI_URBAN_CENTER, state.cfg.minZoom);
         return true;
       }
-      map.fitBounds(window.GeoCatalog.ITAJAI_BOUNDS, { padding: [20, 20] });
+      map.fitBounds(ITAJAI_BOUNDS, { padding: [20, 20] });
       return false;
     }
 
@@ -802,73 +1478,22 @@ window.GeoLayerEngine = (() => {
       clearTimeout(moveTimer);
       moveTimer = setTimeout(() => {
         for (const [id, state] of activeLayers) {
-          if (state.cfg.viewportMode) {
+          const needsViewportRefresh =
+            state.cfg.viewportMode &&
+            !(state.usingFallback && state.cfg.fallback?.ignoreMinZoomOnFallback) &&
+            !state.isTileFallback;
+          if (needsViewportRefresh) {
             loadOrRefreshLayer(id, { notifyZoom: false });
           }
         }
       }, 260);
     });
 
-    async function identifyAtPoint(latlng) {
-      const results = [];
-      const tolDeg = 0.00025 * Math.pow(2, Math.max(0, 15 - map.getZoom()));
-      const env = `${latlng.lng - tolDeg},${latlng.lat - tolDeg},${latlng.lng + tolDeg},${latlng.lat + tolDeg}`;
-
-      const targetIds = new Set([...activeLayers.keys()]);
-      for (const cid of ['bairros_2025', 'zoneamento_2024', 'planta_cadastral']) targetIds.add(cid);
-
-      const tasks = [...targetIds].map(async (id) => {
-        const state = activeLayers.get(id);
-        const found = state ? { layer: state.cfg } : getLayerById(id);
-        if (!found) return;
-        const cfg = found.layer;
-        const isCoreExtra = !activeLayers.has(id);
-
-        if ((cfg.isUserLayer || cfg.isLocalData) && state?.geojson) {
-          const hits = findLocalHits(state.geojson, latlng);
-          if (hits.length) {
-            results.push({ layerId: id, layerName: cfg.name, cfg, features: hits, isCoreExtra: false });
-          }
-          return;
-        }
-        if (!cfg.service) return;
-
-        try {
-          const baseUrl = buildServiceUrl(cfg.service);
-          const params = new URLSearchParams({
-            geometry: cfg.geomType === 'polygon' ? `${latlng.lng},${latlng.lat}` : env,
-            geometryType: cfg.geomType === 'polygon' ? 'esriGeometryPoint' : 'esriGeometryEnvelope',
-            inSR: '4326',
-            spatialRel: 'esriSpatialRelIntersects',
-            outFields: '*',
-            returnGeometry: 'false',
-            resultRecordCount: '5',
-            f: 'json',
-          });
-          const resp = await fetch(`${baseUrl}/query?${params.toString()}`, { cache: 'no-store' });
-          if (!resp.ok) return;
-          const json = await resp.json();
-          const feats = (json.features || []).map((f) => ({ properties: f.attributes || {} }));
-          if (feats.length) {
-            results.push({ layerId: id, layerName: cfg.name, cfg, features: feats, isCoreExtra });
-          }
-        } catch {
-          // ignore
-        }
-      });
-
-      await Promise.all(tasks);
-      const order = { bairros_2025: 1, zoneamento_2024: 2, planta_cadastral: 3 };
-      results.sort((a, b) => (order[a.layerId] || 50) - (order[b.layerId] || 50));
-      return results;
-    }
-
-    function findLocalHits(geojson, latlng) {
+    function findLocalHits(geojson, latlng, tolDeg = 0.0003) {
       const hits = [];
-      for (const f of geojson.features || []) {
+      for (const f of geojson?.features || []) {
         try {
-          const b = L.geoJSON(f).getBounds();
-          if (b.isValid() && b.pad(0.03).contains(latlng)) {
+          if (geomContainsLatLng(f.geometry, latlng, tolDeg)) {
             hits.push(f);
             if (hits.length >= 5) break;
           }
@@ -879,8 +1504,166 @@ window.GeoLayerEngine = (() => {
       return hits;
     }
 
+    async function getCoreOfflineGeoJson(layerId) {
+      const activeSt = activeLayers.get(layerId);
+      if (activeSt?.geojson?.features?.length) return activeSt.geojson;
+      const cached = dataCache.get(layerId);
+      if (cached?.geojson?.features?.length) return cached.geojson;
+
+      if (layerId === 'bairros_2025' && window.GEOITAJAI_BUNDLE?.bairros) {
+        return normalizeGeoJsonToWgs84(window.GEOITAJAI_BUNDLE.bairros);
+      }
+      if (layerId === 'zoneamento_2024' && window.GEOITAJAI_BUNDLE?.zoneamento_contingency) {
+        return normalizeGeoJsonToWgs84(window.GEOITAJAI_BUNDLE.zoneamento_contingency);
+      }
+      if (layerId === 'planta_cadastral') {
+        try {
+          const idx = await ensureParcelGridIndex();
+          const latlngCenter = map.getCenter();
+          // Caso já esteja em cache o quadrante, reaproveita sem refetch pesado
+          const cell = idx.find(
+            (c) =>
+              c.sw[0] <= latlngCenter.lat &&
+              latlngCenter.lat <= c.ne[0] &&
+              c.sw[1] <= latlngCenter.lng &&
+              latlngCenter.lng <= c.ne[1]
+          );
+          if (cell && parcelTileCache.has(cell.nome)) {
+            return { type: 'FeatureCollection', features: parcelTileCache.get(cell.nome) };
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return null;
+    }
+
+    async function identifyAtPoint(latlng) {
+      const results = [];
+      const tolDeg = 0.00025 * Math.pow(2, Math.max(0, 15 - map.getZoom()));
+      const env = `${latlng.lng - tolDeg},${latlng.lat - tolDeg},${latlng.lng + tolDeg},${latlng.lat + tolDeg}`;
+
+      const targetIds = new Set([...activeLayers.keys()]);
+      for (const cid of ['bairros_2025', 'zoneamento_2024', 'planta_cadastral']) targetIds.add(cid);
+
+      const status = await ensureArcgisStatus();
+
+      const tasks = [...targetIds].map(async (id) => {
+        const state = activeLayers.get(id);
+        const found = state ? { layer: state.cfg } : getLayerById(id);
+        if (!found) return;
+        const cfg = found.layer;
+        const isCoreExtra = !activeLayers.has(id);
+
+        if (state?.geojson) {
+          const hits = findLocalHits(state.geojson, latlng, tolDeg);
+          if (hits.length) {
+            results.push({ layerId: id, layerName: cfg.name, cfg, features: hits, isCoreExtra });
+          }
+          return;
+        }
+
+        if (cfg.isUserLayer || cfg.isLocalData) return;
+
+        if (status === 'online' && cfg.service) {
+          try {
+            const baseUrl = buildServiceUrl(cfg.service);
+            const params = new URLSearchParams({
+              geometry: cfg.geomType === 'polygon' ? `${latlng.lng},${latlng.lat}` : env,
+              geometryType: cfg.geomType === 'polygon' ? 'esriGeometryPoint' : 'esriGeometryEnvelope',
+              inSR: '4326',
+              spatialRel: 'esriSpatialRelIntersects',
+              outFields: '*',
+              returnGeometry: 'false',
+              resultRecordCount: '5',
+              f: 'json',
+            });
+            const resp = await fetchWithTimeout(`${baseUrl}/query?${params.toString()}`, { cache: 'no-store' }, 5000);
+            if (resp.ok) {
+              const json = await resp.json();
+              const feats = (json.features || []).map((f) => ({ properties: f.attributes || {} }));
+              if (feats.length) {
+                results.push({ layerId: id, layerName: cfg.name, cfg, features: feats, isCoreExtra });
+                return;
+              }
+            }
+          } catch {
+            // tenta contingência local abaixo
+          }
+        }
+
+        // Contingência local / GeoItajaí para Raio-X instantâneo
+        if (id === 'planta_cadastral') {
+          try {
+            const idx = await ensureParcelGridIndex();
+            const cell = idx.find(
+              (c) =>
+                c.sw[0] <= latlng.lat &&
+                latlng.lat <= c.ne[0] &&
+                c.sw[1] <= latlng.lng &&
+                latlng.lng <= c.ne[1]
+            );
+            if (cell) {
+              let feats = parcelTileCache.get(cell.nome);
+              if (!feats) {
+                const resp = await fetchWithTimeout(`${PARCEL_TILE_URL}/${cell.nome}.geojson`, {}, 6000);
+                if (resp.ok) {
+                  const raw = await resp.json();
+                  feats = Array.isArray(raw) ? raw : raw?.features || [];
+                  parcelTileCache.set(cell.nome, feats);
+                }
+              }
+              if (feats?.length) {
+                const hits = findLocalHits({ type: 'FeatureCollection', features: feats }, latlng, tolDeg).map(
+                  (f) => ({
+                    ...f,
+                    properties: {
+                      ...f.properties,
+                      inscricao: f.properties?.inscricao || f.properties?.inscrlig,
+                    },
+                  })
+                );
+                if (hits.length) {
+                  results.push({
+                    layerId: id,
+                    layerName: cfg.name,
+                    cfg,
+                    features: hits,
+                    isCoreExtra,
+                  });
+                }
+              }
+            }
+          } catch {
+            // ignore
+          }
+          return;
+        }
+
+        const fallbackGj = await getCoreOfflineGeoJson(id);
+        if (fallbackGj) {
+          const hits = findLocalHits(fallbackGj, latlng, tolDeg);
+          if (hits.length) {
+            results.push({ layerId: id, layerName: cfg.name, cfg, features: hits, isCoreExtra });
+          }
+        }
+      });
+
+      await Promise.all(tasks);
+      const order = { bairros_2025: 1, zoneamento_2024: 2, planta_cadastral: 3 };
+      results.sort((a, b) => (order[a.layerId] || 50) - (order[b.layerId] || 50));
+      return results;
+    }
+
     function exportLayerGeoJSON(layerId) {
       const state = activeLayers.get(layerId);
+      if (state?.isTileFallback) {
+        callbacks.onToast?.(
+          `"${state.cfg.name}" está em modo matricial (tiles PNG) de contingência — exportação vetorial indisponível offline.`,
+          'info'
+        );
+        return;
+      }
       if (!state?.geojson?.features?.length) {
         callbacks.onToast?.('Ative a camada e aguarde o carregamento antes de exportar.', 'info');
         return;
@@ -916,6 +1699,7 @@ window.GeoLayerEngine = (() => {
         throw new Error('Formato não suportado. Use .geojson, .json, .kml ou Shapefile .zip');
       }
 
+      geojson = normalizeGeoJsonToWgs84(geojson);
       if (!geojson?.features?.length) {
         throw new Error('O arquivo não contém feições geográficas válidas.');
       }
@@ -951,7 +1735,12 @@ window.GeoLayerEngine = (() => {
       const placemarks = [...doc.querySelectorAll('Placemark')];
       const features = [];
       const parseCoords = (str) =>
-        str.trim().split(/\s+/).map((p) => p.split(',').map(Number)).filter((c) => c.length >= 2 && Number.isFinite(c[0]) && Number.isFinite(c[1])).map((c) => [c[0], c[1]]);
+        str
+          .trim()
+          .split(/\s+/)
+          .map((p) => p.split(',').map(Number))
+          .filter((c) => c.length >= 2 && Number.isFinite(c[0]) && Number.isFinite(c[1]))
+          .map((c) => [c[0], c[1]]);
       for (const pm of placemarks) {
         const name = pm.querySelector('name')?.textContent?.trim() || 'Feição KML';
         const desc = pm.querySelector('description')?.textContent?.trim() || '';
@@ -959,9 +1748,16 @@ window.GeoLayerEngine = (() => {
         const ls = pm.querySelector('LineString coordinates');
         const pg = pm.querySelector('Polygon outerBoundaryIs LinearRing coordinates');
         let geometry = null;
-        if (pt) { const c = parseCoords(pt.textContent)[0]; if (c) geometry = { type: 'Point', coordinates: c }; }
-        else if (ls) { const c = parseCoords(ls.textContent); if (c.length >= 2) geometry = { type: 'LineString', coordinates: c }; }
-        else if (pg) { const c = parseCoords(pg.textContent); if (c.length >= 3) geometry = { type: 'Polygon', coordinates: [c] }; }
+        if (pt) {
+          const c = parseCoords(pt.textContent)[0];
+          if (c) geometry = { type: 'Point', coordinates: c };
+        } else if (ls) {
+          const c = parseCoords(ls.textContent);
+          if (c.length >= 2) geometry = { type: 'LineString', coordinates: c };
+        } else if (pg) {
+          const c = parseCoords(pg.textContent);
+          if (c.length >= 3) geometry = { type: 'Polygon', coordinates: [c] };
+        }
         if (geometry) features.push({ type: 'Feature', properties: { nome: name, descricao: desc }, geometry });
       }
       return { type: 'FeatureCollection', features };
@@ -970,9 +1766,29 @@ window.GeoLayerEngine = (() => {
     function getActiveLegends() {
       return getOrderedActiveLayers().map((state) => {
         const { cfg } = state;
-        const entry = { id: cfg.id, name: cfg.name, geomType: cfg.geomType, swatches: [] };
-        if (cfg.colorMap) {
-          for (const [label, color] of Object.entries(cfg.colorMap)) {
+        const entry = {
+          id: cfg.id,
+          name: cfg.name,
+          geomType: cfg.geomType,
+          usingFallback: state.usingFallback,
+          fallbackLabel: state.fallbackLabel,
+          isTileFallback: state.isTileFallback,
+          offlineBlocked: state.offlineBlocked,
+          swatches: [],
+        };
+
+        if (state.offlineBlocked) {
+          entry.swatches.push({
+            label: 'Servidor oficial inacessível',
+            color: '#cbd5e1',
+            outline: true,
+          });
+          return entry;
+        }
+
+        const cmap = getEffectiveColorMap(cfg, state);
+        if (cmap) {
+          for (const [label, color] of Object.entries(cmap)) {
             entry.swatches.push({ label, color });
           }
         } else {
@@ -985,7 +1801,7 @@ window.GeoLayerEngine = (() => {
               ? cfg.style?.color || '#0284c7'
               : cfg.style?.fillColor || '#3b82f6';
           entry.swatches.push({
-            label: cfg.name,
+            label: state.isTileFallback ? `${cfg.name} (${state.fallbackLabel || 'Tiles'})` : cfg.name,
             color,
             outline: cfg.outlineMode,
             dashed: Boolean(cfg.style?.dashArray),
@@ -1018,11 +1834,23 @@ window.GeoLayerEngine = (() => {
       exportLayerGeoJSON,
       importUserFile,
       getActiveLegends,
+      getArcgisStatus: () => arcgisStatus,
+      ensureArcgisStatus,
+      recheckArcgisServer,
+      reloadLayer: (id) => loadOrRefreshLayer(id, { notifyZoom: true }),
       prettyFieldName,
       formatFieldValue,
       escapeHtml,
     };
   }
 
-  return { createEngine, prettyFieldName, formatFieldValue, escapeHtml };
+  return {
+    createEngine,
+    prettyFieldName,
+    formatFieldValue,
+    escapeHtml,
+    normalizeGeoJsonToWgs84,
+    geomContainsLatLng,
+    fetchWithTimeout,
+  };
 })();
